@@ -1,250 +1,431 @@
+import sqlite3
+import datetime
+import bcrypt
 import streamlit as st
+from streamlit_calendar import calendar
 
-st.title("첫 배포 확인 👋")
-st.write("여기까지 보이면 배포 성공입니다.")
+# =========================================================
+# 1. DB 연동 및 테이블 생성 / 업데이트
+# =========================================================
+DB_FILE = "diary_app.db"
 
-import streamlit as st
+def get_connection():
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
 
-# 1. 페이지 기본 설정 (귀여운 파비콘과 타이틀)
-st.set_page_config(
-    page_title="말랑퐁당 MBTI 여행 추천",
-    page_icon="✈️",
-    layout="centered"
-)
+def init_db():
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # 사용자 테이블 (아이디, 암호화된 비밀번호, 닉네임)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            nickname TEXT NOT NULL
+        )
+    ''')
+    
+    # 일기 테이블 (사용자ID, 날짜, 감정, 내용, 공개 여부)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS diaries (
+            username TEXT,
+            date TEXT,
+            emotion TEXT,
+            content TEXT,
+            is_public INTEGER DEFAULT 0,
+            PRIMARY KEY (username, date),
+            FOREIGN KEY (username) REFERENCES users(username)
+        )
+    ''')
+    
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN nickname TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        c.execute("ALTER TABLE diaries ADD COLUMN is_public INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
 
-# 2. 커스텀 CSS (사랑스러운 핑크&파스텔 테마 스타일링)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# DB 헬퍼 함수들
+def register_user(username, password, nickname):
+    conn = get_connection()
+    c = conn.cursor()
+    hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    try:
+        c.execute("INSERT INTO users (username, password, nickname) VALUES (?, ?, ?)", 
+                  (username, hashed_pw, nickname))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def login_user(username, password):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT password, nickname FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        stored_pw, nickname = row[0], row[1]
+        if bcrypt.checkpw(password.encode('utf-8'), stored_pw.encode('utf-8')):
+            return True, nickname
+    return False, None
+
+def get_user_diaries(username, is_public_flag):
+    """특정 사용자의 비밀일기(0) 또는 공개일기(1) 조회"""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT date, emotion, content FROM diaries WHERE username = ? AND is_public = ?", 
+              (username, 1 if is_public_flag else 0))
+    rows = c.fetchall()
+    conn.close()
+    
+    diaries = {}
+    for r in rows:
+        diaries[r[0]] = {
+            "emotion": r[1],
+            "content": r[2]
+        }
+    return diaries
+
+def get_all_public_diaries():
+    """모든 사용자의 공개 일기 목록 (공개일기 페이지의 '다른 사람 일기' 구경용)"""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('''
+        SELECT d.date, d.emotion, d.content, u.nickname, d.username
+        FROM diaries d
+        JOIN users u ON d.username = u.username
+        WHERE d.is_public = 1
+        ORDER BY d.date DESC
+    ''')
+    rows = c.fetchall()
+    conn.close()
+    
+    public_list = []
+    for r in rows:
+        public_list.append({
+            "date": r[0],
+            "emotion": r[1],
+            "content": r[2],
+            "nickname": r[3],
+            "username": r[4]
+        })
+    return public_list
+
+def save_diary(username, date_str, emotion, content, is_public):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO diaries (username, date, emotion, content, is_public)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(username, date) DO UPDATE SET
+            emotion=excluded.emotion,
+            content=excluded.content,
+            is_public=excluded.is_public
+    ''', (username, date_str, emotion, content, 1 if is_public else 0))
+    conn.commit()
+    conn.close()
+
+def delete_diary(username, date_str):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM diaries WHERE username = ? AND date = ?", (username, date_str))
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# 2. UI 및 테마 설정
+# =========================================================
+st.set_page_config(page_title="소소한 일기장", page_icon="🧸", layout="centered")
+
 st.markdown("""
-    <style>
-    /* 전체 배경 및 폰트 설정 */
-    .main {
-        background-color: #FFF5F7;
-    }
     
-    /* 타이틀 카드 스타일 */
-    .header-card {
-        background: linear-gradient(135deg, #FF9A9E 0%, #FECFEF 100%);
-        padding: 30px;
-        border-radius: 25px;
-        text-align: center;
-        color: white;
-        box-shadow: 0px 10px 20px rgba(255, 154, 158, 0.3);
-        margin-bottom: 25px;
-    }
-    
-    /* 메인 제목 */
-    .header-title {
-        font-size: 2.2rem;
-        font-weight: 800;
-        margin-bottom: 5px;
-        text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
-    }
-    
-    /* 결과 카드 스타일 */
-    .result-card {
-        background-color: white;
-        padding: 25px;
-        border-radius: 20px;
-        border: 2px solid #FFD1DC;
-        box-shadow: 0px 8px 15px rgba(255, 182, 193, 0.2);
-        margin-top: 20px;
-    }
-    
-    /* 태그 스타일 */
-    .tag {
-        display: inline-block;
-        background-color: #FFE4E1;
-        color: #FF1493;
-        padding: 5px 12px;
-        border-radius: 15px;
-        font-size: 0.9rem;
-        font-weight: bold;
-        margin-right: 5px;
-        margin-bottom: 10px;
-    }
-
-    /* 스트림릿 버튼 커스텀 */
-    .stButton>button {
-        background: linear-gradient(135deg, #FFB6C1 0%, #FF69B4 100%);
-        color: white;
-        border: none;
-        border-radius: 20px;
-        padding: 12px 25px;
-        font-weight: bold;
-        font-size: 1.1rem;
-        box-shadow: 0px 5px 10px rgba(255, 105, 180, 0.3);
-        transition: all 0.3s ease;
-        width: 100%;
-    }
-    
-    .stButton>button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0px 8px 15px rgba(255, 105, 180, 0.4);
-    }
-    </style>
 """, unsafe_allow_html=True)
 
-# 3. MBTI별 귀여운 여행지 데이터 베이스
-mbti_travel_data = {
-    "ISTJ": {
-        "destination": "🇯🇵 일본 교토",
-        "concept": "차분하고 완벽한 질서의 힐링 여행 🍵",
-        "description": "계획표대로 착착! 고즈넉한 정원과 깔끔한 거리에서 정갈한 휴식을 즐길 수 있어요.",
-        "tags": ["#알찬계획", "#정갈함", "#고즈넉한풍경", "#말랑말랑산책"],
-        "tip": "분단위로 짜놓은 일정표대로 움직일 때 엔돌핀이 솟구쳐요!"
-    },
-    "ISFJ": {
-        "destination": "🇨🇭 스위스 인터라켄",
-        "concept": "동화 속 아늑한 마을로 떠나는 여행 🏔️",
-        "description": "따뜻하고 아기자기한 풍경 속에서 마음까지 보송보송해지는 평화로운 휴양지예요.",
-        "tags": ["#동화같은풍경", "#마음치유", "#친절한사람들", "#포근함"],
-        "tip": "기차 창밖을 바라보며 핫초코 한 잔 마시는 매력에 빠져보세요."
-    },
-    "INFJ": {
-        "destination": "🇨🇿 체코 프라하",
-        "concept": "감성과 낭만이 넘치는 비밀스러운 여행 🏰",
-        "description": "조용한 골목길, 노을 지는 까를교 위에서 오롯이 나의 내면과 대화할 수 있는 곳이에요.",
-        "tags": ["#감성폭발", "#낭만골목", "#깊은생각", "#예술의거리"],
-        "tip": "작은 일기장을 챙겨가서 카페에서 느낀 감정을 적어보세요."
-    },
-    "INTJ": {
-        "destination": "🇮🇸 아이슬란드 레이캬비크",
-        "concept": "신비로운 우주를 탐험하는 지적 여행 🌌",
-        "description": "오로라와 빙하! 대자연의 경이로움 속에서 깊은 통찰과 탐구를 즐겨보세요.",
-        "tags": ["#오로라탐사", "#웅장한자연", "#조용한탐험", "#지적호기심"],
-        "tip": "완벽하게 조사해둔 철저한 경로로 탐험을 시작해보세요!"
-    },
-    "ISTP": {
-        "destination": "🇳🇿 뉴질랜드 퀸스타운",
-        "concept": "스릴 가득! 자유로운 익스트림 여행 🏂",
-        "description": "번지점프부터 스카이다이빙까지! 몸으로 직접 느끼는 짜릿한 자유로움이 기다려요.",
-        "tags": ["#액티비티만점", "#자유로운영혼", "#스릴만점", "#멋진자연"],
-        "tip": "너무 복잡한 계획보단 그날 마음 내키는 액티비티를 선택하세요."
-    },
-    "ISFP": {
-        "destination": "🇮🇩 인도네시아 발리",
-        "concept": "느릿느릿 여유롭고 누워있는 감성 휴양 🌴",
-        "description": "예쁜 카페, 파도 소리, 붉은 노을 아래서 느긋하게 뒹굴거리며 예술적 감성을 채워요.",
-        "tags": ["#느림의학학", "#선셋맛집", "#요가와힐링", "#감성샷"],
-        "tip": "알람을 끄고 일어나고 싶을 때 일어나는 것이 핵심 포인트!"
-    },
-    "INFP": {
-        "destination": "🇹🇭 태국 치앙마이",
-        "concept": "몽글몽글 감성 충전 한 달 살기 여행 ☕",
-        "description": "아기자기한 소품샵, 예쁜 카페에서 조용히 책을 읽고 아침 시장을 거니는 로망이 이뤄져요.",
-        "tags": ["#몽글몽글감성", "#예쁜소품샵", "#평화로운일상", "#힐링라이프"],
-        "tip": "마음에 드는 카페에 앉아 멍때리는 시간을 꼭 가져보세요."
-    },
-    "INTP": {
-        "destination": "🇬🇧 영국 런던",
-        "concept": "호기심을 자극하는 박물관&역사 여행 🏛️",
-        "description": "세계적인 박물관과 미술관이 가득! 흥미로운 지식과 문화를 마음껏 탐구해봐요.",
-        "tags": ["#지적탐구", "#박물관투어", "#독특한문화", "#자유로운생각"],
-        "tip": "관심 있는 주제의 전시회를 찾아 홀로 몰입해보는 것을 추천해요."
-    },
-    "ESTP": {
-        "destination": "🇺🇸 미국 라스베이거스",
-        "concept": "화려함 그 자체! 잠들지 않는 에너제틱 여행 🎰",
-        "description": "반짝이는 조명, 화려한 쇼, 즉흥적인 즐거움이 넘치는 에너지 충전소예요!",
-        "tags": ["#에너지뿜뿜", "#화려한야경", "#즉흥여행", "#즐거움가득"],
-        "tip": "현지에서 만난 새로운 친구들과 즉석에서 즐거운 추억을 만들어보세요."
-    },
-    "ESFP": {
-        "destination": "🇪🇸 스페인 바르셀로나",
-        "concept": "흥겨운 음악과 축제가 가득한 열정 여행 💃",
-        "description": "맛있는 타파스, 신나는 음악, 언제나 웃음이 가득한 거리에서 축제 같은 하루를 보내요.",
-        "tags": ["#열정파티", "#맛있는음식", "#해변의자유", "#항상즐거워"],
-        "tip": "거리의 음악 소리에 맞춰 신나게 몸을 흔들어보세요!"
-    },
-    "ENFP": {
-        "destination": "🇻🇳 베트남 다낭",
-        "concept": "알록달록 통통 튀는 즐거운 감성 여행 🎈",
-        "description": "맛있는 길거리 음식, 알록달록한 등불, 바다에서의 해양 스포츠까지 즐길 거리가 차고 넘쳐요!",
-        "tags": ["#통통튀는매력", "#야시장탐방", "#즐거움천국", "#인생샷명소"],
-        "tip": "오늘 만난 현지인과 친구가 되어 숨은 맛집을 물어보세요!"
-    },
-    "ENTP": {
-        "destination": "🇹🇼 대만 타이베이",
-        "concept": "다채로운 맛과 통통 튀는 호기심 여행 🥟",
-        "description": "밤마다 열리는 야시장 탐방부터 독특한 골목길까지! 끊임없이 새로운 재미를 발견할 수 있어요.",
-        "tags": ["#야시장뿌시기", "#새로운경험", "#호기심자극", "#식도락탐험"],
-        "tip": "처음 보는 신기한 음식에 주저하지 말고 도전해보세요!"
-    },
-    "ESTJ": {
-        "destination": "🇸🇬 싱가포르",
-        "concept": "스마트하고 완벽하게 정돈된 도심 여행 🏙️",
-        "description": "쾌적하고 안전한 도시, 효율적인 교통, 완벽한 야경 쇼까지 깔끔한 일정 계획에 딱 맞춰져요.",
-        "tags": ["#완벽한동선", "#쾌적함그자체", "#멋진도심야경", "#효율성갑"],
-        "tip": "분 단위로 알차게 짜여진 시티 투어 코스를 완주해보세요."
-    },
-    "ESFJ": {
-        "destination": "🇬🇷 그리스 산토리니",
-        "concept": "사랑하는 사람과 함께하는 낭만 따뜻 여행 💙",
-        "description": "하얀 건물의 파란 지붕, 따스한 햇살 아래 모두가 행복해지는 최고의 추억을 쌓을 수 있어요.",
-        "tags": ["#함께하는행복", "#인생샷천국", "#따뜻한온기", "#로맨틱성지"],
-        "tip": "소중한 사람들에게 보낼 예쁜 엽서를 사서 마음을 전해보세요."
-    },
-    "ENFJ": {
-        "destination": "🇮🇹 이탈리아 피렌체",
-        "concept": "마음을 사로잡는 따뜻한 예술&문화 여행 🎨",
-        "description": "주황빛 지붕 너머로 지는 노을을 바라보며 따뜻한 감동과 영감을 가득 채워오는 곳이에요.",
-        "tags": ["#감동적인풍경", "#예술의향기", "#모두함께즐겁게", "#따뜻한리더"],
-        "tip": "두오모 성당 쿠폴라에 올라 도시 전체의 감동을 나눠보세요."
-    },
-    "ENTJ": {
-        "destination": "🇺🇸 미국 뉴욕",
-        "concept": "당당하고 에너제틱한 트렌디 시티 여행 🗽",
-        "description": "세계의 중심! 거대한 빌딩 숲과 넘치는 열정 속에서 영감을 얻고 정상을 느껴보세요.",
-        "tags": ["#열정가득", "#트렌드중심", "#성취감뿜뿜", "#웅장한시티"],
-        "tip": "브로드웨이 뮤지컬 로열석에서 최고의 공연을 감상해보세요!"
-    }
-}
+# 세션 상태 초기화
+if "user" not in st.session_state:
+    st.session_state.user = None
+if "nickname" not in st.session_state:
+    st.session_state.nickname = None
 
-# 4. 헤더 영역 출력
-st.markdown("""
-    <div class="header-card">
-        <div style="font-size: 3rem; margin-bottom: 10px;">✨🎀✨</div>
-        <div class="header-title">말랑퐁당 MBTI 여행지 추천</div>
-        <div style="font-size: 1.1rem; opacity: 0.9;">나의 성격 유형에 딱 맞는 러블리 여행지는 어디일까? ✈️💖</div>
-    </div>
-""", unsafe_allow_html=True)
+today_str = datetime.date.today().strftime("%Y-%m-%d")
 
-# 5. MBTI 선택 영역 (아기자기한 선택창)
-st.write("### 💖 당신의 MBTI를 선택해주세요!")
-selected_mbti = st.selectbox(
-    "아래 목록에서 쏙 골라보세요 🌸",
-    list(mbti_travel_data.keys()),
-    index=6 # 기본값: INFP (가장 인기있는 파스텔 감성)
-)
+if "selected_date" not in st.session_state:
+    st.session_state.selected_date = today_str
 
-# 6. 추천 버튼 클릭 시 결과 출력
-if st.button("✨ 나에게 꼭 맞는 여행지 찾기 ✨"):
-    # 가벼운 풍선 애니메이션 효과
-    st.balloons()
+# 메인 페이지 상태 ('secret_calendar', 'public_calendar', 'diary_editor')
+if "page" not in st.session_state:
+    st.session_state.page = "secret_calendar"
+
+# 일기 편집기 모드 (비밀일기인지 공개일기인지 구분)
+if "editor_is_public" not in st.session_state:
+    st.session_state.editor_is_public = False
+
+STANDARD_EMOTIONS = ["😊 기쁨", "😌 평온", "😢 슬픔", "😡 화남", "😴 피곤"]
+EMOJI_LIST = [e.split()[0] for e in STANDARD_EMOTIONS]
+
+
+# =========================================================
+# 3. 로그인 / 회원가입 화면
+# =========================================================
+if st.session_state.user is None:
+    st.title("🧸 소소하고 포근한 일기장")
     
-    info = mbti_travel_data[selected_mbti]
+    auth_mode = st.radio("서비스 이용을 위해 로그인해 주세요.", ["로그인", "회원가입"], horizontal=True)
     
-    # 결과 카드 출력
-    st.markdown(f"""
-        <div class="result-card">
-            <h3 style="color: #FF69B4; margin-top:0;">🎀 {selected_mbti}를 위한 추천 여행지 🎀</h3>
-            <h1 style="color: #333; font-size: 2.2rem; margin-bottom: 10px;">{info['destination']}</h1>
-            <p style="font-size: 1.2rem; font-weight: bold; color: #FF1493;">"{info['concept']}"</p>
-            <hr style="border: 0.5px solid #FFE4E1; margin: 15px 0;">
-            <p style="font-size: 1.05rem; line-height: 1.6; color: #555;">{info['description']}</p>
-            <div style="margin-top: 15px;">
-                {" ".join([f'<span class="tag">{tag}</span>' for tag in info['tags']])}
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    # 추가 꿀팁 아코디언
-    with st.expander("🍯 **사랑스러운 여행 꿀팁 보기**"):
-        st.write(info['tip'])
+    username_input = st.text_input("아이디", key="auth_user")
+    password_input = st.text_input("비밀번호", type="password", key="auth_pw")
 
-# 7. 하단 푸터 영역
-st.markdown("""
-    <br><br>
-    <div style="text-align: center; color: #BBB; font-size: 0.85rem;">
-        Made with 💕 for your lovely trip!
-    </div>
-""", unsafe_allow_html=True)
+    if auth_mode == "로그인":
+        if st.button("로그인하기", use_container_width=True):
+            if username_input and password_input:
+                is_success, nickname = login_user(username_input, password_input)
+                if is_success:
+                    st.session_state.user = username_input
+                    st.session_state.nickname = nickname if nickname else username_input
+                    st.success(f"{st.session_state.nickname}님 환영합니다!")
+                    st.rerun()
+                else:
+                    st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+            else:
+                st.warning("아이디와 비밀번호를 모두 입력해 주세요.")
+                
+    else:  # 회원가입
+        nickname_input = st.text_input("닉네임 (프로필 이름)", key="auth_nick")
+        if st.button("회원가입하기", use_container_width=True):
+            if username_input and password_input and nickname_input:
+                if register_user(username_input, password_input, nickname_input.strip()):
+                    st.success("회원가입이 완료되었습니다! 로그인 탭에서 로그인해 주세요.")
+                else:
+                    st.error("이미 존재하는 아이디입니다.")
+            else:
+                st.warning("모든 정보를 입력해 주세요.")
+
+# =========================================================
+# 4. 메인 서비스 화면 (로그인 완료 시)
+# =========================================================
+else:
+    current_user = st.session_state.user
+    current_nickname = st.session_state.nickname
+    
+    # 사이드바
+    st.sidebar.title("🧸 소소한 일기장")
+    st.sidebar.write(f"👤 **{current_nickname}** 님")
+    
+    if st.sidebar.button("🔒 로그아웃"):
+        st.session_state.user = None
+        st.session_state.nickname = None
+        st.session_state.page = "secret_calendar"
+        st.rerun()
+
+    st.sidebar.markdown("---")
+    
+    # 메뉴를 '비밀일기'와 '공개일기' 두 가지로 명확히 분리
+    nav_index = 0 if st.session_state.page in ["secret_calendar", "diary_editor"] and not st.session_state.editor_is_public else 1
+    
+    nav_choice = st.sidebar.radio(
+        "메뉴 선택",
+        ["🔒 비밀일기", "🌐 공개일기"],
+        index=nav_index
+    )
+
+    if nav_choice == "🔒 비밀일기" and (st.session_state.page != "secret_calendar" and (st.session_state.page == "diary_editor" and st.session_state.editor_is_public)):
+        st.session_state.page = "secret_calendar"
+        st.session_state.editor_is_public = False
+        st.rerun()
+    elif nav_choice == "🌐 공개일기" and (st.session_state.page != "public_calendar" and (st.session_state.page == "diary_editor" and not st.session_state.editor_is_public)):
+        st.session_state.page = "public_calendar"
+        st.session_state.editor_is_public = True
+        st.rerun()
+
+    st.title("🧸 소소하고 포근한 일기장")
+
+    # ---------------------------------------------------------
+    # PAGE 1: 🔒 비밀일기 페이지 (달력 포함)
+    # ---------------------------------------------------------
+    if st.session_state.page == "secret_calendar":
+        st.header("🔒 나만의 비밀일기")
+        st.caption("이곳의 일기는 오직 나에게만 보여집니다. 달력에서 날짜를 클릭하면 일기를 쓰고 수정할 수 있습니다.")
+
+        secret_diaries = get_user_diaries(current_user, is_public_flag=False)
+
+        calendar_events = []
+        for date_str, diary_data in secret_diaries.items():
+            if diary_data.get("content") and diary_data["content"].strip():
+                calendar_events.append({
+                    "title": f"🔒 {diary_data['emotion']} 비밀일기",
+                    "start": date_str,
+                    "end": date_str,
+                    "allDay": True,
+                    "color": "#6C5B52"
+                })
+
+        calendar_options = {
+            "headerToolbar": {
+                "left": "prev,next today",
+                "center": "title",
+                "right": "dayGridMonth"
+            },
+            "initialView": "dayGridMonth",
+            "selectable": True,
+        }
+
+        cal_res = calendar(events=calendar_events, options=calendar_options, key="secret_diary_calendar")
+
+        clicked_date = None
+        if cal_res and "dateClick" in cal_res:
+            clicked_date = cal_res["dateClick"]["date"].split("T")[0]
+        elif cal_res and "select" in cal_res:
+            clicked_date = cal_res["select"]["start"].split("T")[0]
+
+        if clicked_date:
+            st.session_state.selected_date = clicked_date
+            st.session_state.editor_is_public = False
+            st.session_state.page = "diary_editor"
+            st.rerun()
+
+    # ---------------------------------------------------------
+    # PAGE 2: 🌐 공개일기 페이지 (내 공개달력 + 모두의 공개피드)
+    # ---------------------------------------------------------
+    elif st.session_state.page == "public_calendar":
+        st.header("🌐 공유하는 공개일기")
+        st.caption("내가 공개로 설정한 일기들과 다른 사람들의 공개 일기를 만날 수 있는 공간입니다.")
+
+        public_tab1, public_tab2 = st.tabs(["🗓️ 내 공개일기 달력", "📖 모두의 이야기 모아보기"])
+
+        with public_tab1:
+            st.subheader("내 공개일기 달력")
+            st.caption("날짜를 선택해 공개 일기를 작성하거나 수정해 보세요.")
+            
+            my_public_diaries = get_user_diaries(current_user, is_public_flag=True)
+
+            calendar_events = []
+            for date_str, diary_data in my_public_diaries.items():
+                if diary_data.get("content") and diary_data["content"].strip():
+                    calendar_events.append({
+                        "title": f"🌐 {diary_data['emotion']} 공개일기",
+                        "start": date_str,
+                        "end": date_str,
+                        "allDay": True,
+                        "color": "#DDA15E"
+                    })
+
+            calendar_options = {
+                "headerToolbar": {
+                    "left": "prev,next today",
+                    "center": "title",
+                    "right": "dayGridMonth"
+                },
+                "initialView": "dayGridMonth",
+                "selectable": True,
+            }
+
+            cal_res_pub = calendar(events=calendar_events, options=calendar_options, key="public_diary_calendar")
+
+            clicked_date_pub = None
+            if cal_res_pub and "dateClick" in cal_res_pub:
+                clicked_date_pub = cal_res_pub["dateClick"]["date"].split("T")[0]
+            elif cal_res_pub and "select" in cal_res_pub:
+                clicked_date_pub = cal_res_pub["select"]["start"].split("T")[0]
+
+            if clicked_date_pub:
+                st.session_state.selected_date = clicked_date_pub
+                st.session_state.editor_is_public = True
+                st.session_state.page = "diary_editor"
+                st.rerun()
+
+        with public_tab2:
+            st.subheader("모두가 남긴 공개 일기")
+            all_publics = get_all_public_diaries()
+            if all_publics:
+                for item in all_publics:
+                    with st.container():
+                        st.markdown(f"#### {item['emotion']} **{item['nickname']}** 님의 이야기")
+                        st.caption(f"날짜: {item['date']}")
+                        st.info(item['content'])
+                        st.markdown("---")
+            else:
+                st.write("🌿 아직 등록된 공개 일기가 없어요.")
+
+    # ---------------------------------------------------------
+    # PAGE 3: 통합 일기 작성 / 수정 페이지
+    # ---------------------------------------------------------
+    elif st.session_state.page == "diary_editor":
+        selected_date = st.session_state.selected_date
+        is_public_mode = st.session_state.editor_is_public
+        mode_icon = "🌐 공개일기" if is_public_mode else "🔒 비밀일기"
+
+        st.header(f"✏️ {mode_icon} 작성/수정 ({selected_date})")
+
+        # 해당 모드(공개/비밀)의 기존 데이터 로드
+        user_diaries = get_user_diaries(current_user, is_public_flag=is_public_mode)
+        has_existing = (
+            selected_date in user_diaries and 
+            bool(user_diaries[selected_date].get("content", "").strip())
+        )
+        
+        existing_data = user_diaries.get(selected_date, {})
+        saved_emotion = existing_data.get("emotion", "😊")
+        saved_content = existing_data.get("content", "")
+
+        default_emotion_index = 0
+        if saved_emotion in EMOJI_LIST:
+            default_emotion_index = EMOJI_LIST.index(saved_emotion)
+
+        selected_emotion_label = st.radio(
+            "이날의 감정을 선택해 주세요:",
+            options=STANDARD_EMOTIONS,
+            index=default_emotion_index,
+            horizontal=True,
+            key=f"editor_emotion_{selected_date}_{is_public_mode}"
+        )
+        selected_emoji = selected_emotion_label.split()[0]
+
+        diary_text = st.text_area(
+            "내용을 작성하거나 수정해 주세요:",
+            value=saved_content,
+            height=200,
+            placeholder="소소한 이야기라도 좋아요. 자유롭게 적어보세요...",
+            key=f"editor_text_{selected_date}_{is_public_mode}"
+        )
+
+        col1, col2, col3 = st.columns([2, 2, 1])
+        button_label = "💾 수정사항 저장하기" if has_existing else "🧸 마음 저장하기"
+        
+        # 1. 저장 버튼
+        with col1:
+            if st.button(button_label, use_container_width=True):
+                if diary_text.strip():
+                    save_diary(current_user, selected_date, selected_emoji, diary_text.strip(), is_public_mode)
+                    st.success("일기가 성공적으로 저장되었습니다!")
+                    # 저장 후 해당 달력으로 자동 이동
+                    st.session_state.page = "public_calendar" if is_public_mode else "secret_calendar"
+                    st.rerun()
+                else:
+                    st.warning("내용을 입력해 주세요.")
+
+        # 2. 달력으로 돌아가기 버튼
+        with col2:
+            if st.button("🗓️ 달력으로 돌아가기", use_container_width=True):
+                st.session_state.page = "public_calendar" if is_public_mode else "secret_calendar"
+                st.rerun()
+
+        # 3. 삭제 버튼
+        with col3:
+            if has_existing:
+                if st.button("🗑️ 삭제", use_container_width=True):
+                    delete_diary(current_user, selected_date)
+                    st.success("일기가 삭제되었습니다.")
+                    st.session_state.page = "public_calendar" if is_public_mode else "secret_calendar"
+                    st.rerun()
